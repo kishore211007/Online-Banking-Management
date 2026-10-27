@@ -17,6 +17,7 @@ provide. Ratings are split into three clearly labelled kinds:
 
 Usage
 -----
+  python banking_ml_project.py                      # downloads both datasets with kagglehub
   python banking_ml_project.py --bank bank-full.csv --fraud creditcard.csv
   python banking_ml_project.py --bank bank-full.csv --fraud creditcard.csv --out results
   python banking_ml_project.py --bank ... --fraud ... --quick      # fewer trees / folds
@@ -58,7 +59,7 @@ DATASET_WEIGHTS = {
     "Real-world impact": 5,
 }
 MODEL_WEIGHTS = {
-    "Predictive performance": 35, "Robustness": 30, "Speed": 20, "General-purpose suitability": 15,
+    "Predictive performance": 35, "Robustness": 30, "Speed & Efficiency": 20, "General-purpose suitability": 15,
 }
 # JUDGEMENT ratings (1-10). Not measurable from the data: edit with --ratings-json.
 JUDGEMENT = {
@@ -68,6 +69,26 @@ JUDGEMENT = {
 
 
 # --------------------------------------------------------------------------- loading
+KAGGLE_BANK = "janiobachmann/bank-marketing-dataset"   # contains bank.csv (target: deposit)
+KAGGLE_FRAUD = "mlg-ulb/creditcardfraud"               # contains creditcard.csv (target: Class)
+
+
+def kaggle_csv(slug, preferred):
+    """Download a Kaggle dataset with kagglehub and return the path of its CSV."""
+    try:
+        import kagglehub
+    except ImportError as e:
+        raise SystemExit("kagglehub is not installed: pip install kagglehub") from e
+    folder = Path(kagglehub.dataset_download(slug))
+    print(f"  Kaggle dataset {slug} -> {folder}")
+    csvs = sorted(folder.rglob("*.csv"))
+    if not csvs:
+        raise SystemExit(f"No CSV found in {folder}")
+    for c in csvs:
+        if c.name.lower() == preferred:
+            return str(c)
+    return str(max(csvs, key=lambda c: c.stat().st_size))
+
 def read_bank(path):
     with open(path, "r", encoding="utf-8-sig") as f:
         head = f.readline()
@@ -188,7 +209,6 @@ def eda(name, df, target, figdir, slug):
         fig.colorbar(im, ax=ax, fraction=0.04); ax.set_title(f"{name}: correlation heatmap")
         fig.tight_layout(); fig.savefig(figdir / f"{slug}_correlation_heatmap.png", dpi=130); plt.close(fig)
 
-        # top features split by class
         tops = list(corr_t.abs().sort_values(ascending=False).head(4).index)
         fig, axes = plt.subplots(1, len(tops), figsize=(4 * len(tops), 3))
         axes = np.atleast_1d(axes)
@@ -208,7 +228,6 @@ def eda(name, df, target, figdir, slug):
         ax.set_title("log(1 + Amount) by class"); ax.legend()
         fig.tight_layout(); fig.savefig(figdir / f"{slug}_amount_by_class.png", dpi=130); plt.close(fig)
 
-    # categorical positive rate
     cats = [c for c in cat if df[c].nunique() <= 15][:6]
     if cats:
         r = int(np.ceil(len(cats) / 3))
@@ -239,7 +258,6 @@ def make_preprocessor(X, scale):
 
 
 def candidates(quick):
-    """(needs_scaling, estimator). class_weight handles imbalance without altering the test set."""
     ne = 60 if quick else 200
     return {
         "Logistic Regression": (True, LogisticRegression(max_iter=2000, class_weight="balanced")),
@@ -263,7 +281,6 @@ def run_pipeline(name, slug, df, target, out, quick):
     log["train_rows"], log["test_rows"] = int(len(Xtr)), int(len(Xte))
     log["train_positive"], log["test_positive"] = int(ytr.sum()), int(yte.sum())
 
-    # subsample (stratified) of the TRAIN split for cross-validation only, to bound runtime
     cv_cap = 30000 if quick else 100000
     if len(Xtr) > cv_cap:
         Xcv, _, ycv, _ = train_test_split(Xtr, ytr, train_size=cv_cap, stratify=ytr, random_state=SEED)
@@ -280,8 +297,11 @@ def run_pipeline(name, slug, df, target, out, quick):
         t0 = time.perf_counter(); pipe.fit(Xtr, ytr); fit_s = time.perf_counter() - t0
         t0 = time.perf_counter(); p = pipe.predict_proba(Xte)[:, 1]; pred_s = time.perf_counter() - t0
         yhat = (p >= 0.5).astype(int)
+        
+        # Calculate computational efficiency percentage based on total processing time relative to max time
         cv = cross_validate(pipe, Xcv, ycv, cv=skf, scoring={"f1": "f1", "pr_auc": "average_precision"},
                             n_jobs=1)
+        
         rows.append({
             "Model": mname,
             "Accuracy": accuracy_score(yte, yhat),
@@ -296,7 +316,17 @@ def run_pipeline(name, slug, df, target, out, quick):
         })
         probas[mname], cms[mname], fitted[mname] = p, confusion_matrix(yte, yhat), pipe
         joblib.dump(pipe, mdir / f"{slug}_{mname.replace(' ', '_')}.joblib")
+        
     res = pd.DataFrame(rows).set_index("Model")
+    
+    # Compute Efficiency % per model: inverse ratio of total time relative to max execution time, scaled to 100%
+    total_time = res["Fit s"] + res["Predict s"]
+    max_t, min_t = total_time.max(), total_time.min()
+    if max_t == min_t:
+        res["Efficiency %"] = 100.0
+    else:
+        # Efficiency percentage where the fastest model gets 100% and others scale downwards proportionally
+        res["Efficiency %"] = (min_t / total_time) * 100.0
 
     # ---- feature importance (Random Forest) -------------------------------------
     rf = fitted["Random Forest"]
@@ -347,7 +377,6 @@ def auc_to_rating(auc):
 
 
 def rate_dataset(r, judgement):
-    """RULE-DERIVED 1-10 ratings (formulas are heuristics, printed in the report) + JUDGEMENT ratings."""
     s, res = r["stats"], r["results"]
     clip = lambda v: float(np.clip(v, 1, 10))
     ratings = {
@@ -379,19 +408,13 @@ def score_models(runs):
     for r in runs:
         res = r["results"]
         perf[r["name"]] = res[["F1", "PR-AUC", "ROC-AUC"]].mean(axis=1)
-    gp = 10 * pd.concat(perf.values(), axis=1).min(axis=1)  # worst-case perf across both datasets
+    gp = 10 * pd.concat(perf.values(), axis=1).min(axis=1)
     for r in runs:
         res = r["results"]
-        t = res["Fit s"] + res["Predict s"]
-        if t.max() / t.min() < 1.0001:
-            speed = pd.Series(10.0, index=res.index)
-        else:
-            speed = 10 - 9 * (np.log(t / t.min()) / np.log(t.max() / t.min()))
-        disp = res["CV F1 std"] + (res["CV F1 mean"] - res["F1"]).abs()
         tab = pd.DataFrame({
             "Predictive performance": 10 * perf[r["name"]],
-            "Robustness": 10 * (1 - np.minimum(1, disp / 0.2)),
-            "Speed": speed,
+            "Robustness": 10 * (1 - np.minimum(1, (res["CV F1 std"] + (res["CV F1 mean"] - res["F1"]).abs()) / 0.2)),
+            "Speed & Efficiency": res["Efficiency %"] / 10.0,  # mapped from 0-100% to a 0-10 scale
             "General-purpose suitability": gp,
         })
         tab["Weighted score /100"] = [weighted(row, MODEL_WEIGHTS) for _, row in tab.iterrows()]
@@ -429,7 +452,7 @@ def write_report(out, runs, ds_scores, ds_ratings, model_ds, model_overall, args
 
     L += ["## 3. Model results on the held-out 20% test set (MEASURED, decision threshold 0.5)", ""]
     for r in runs:
-        cols = ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC", "PR-AUC", "CV F1 mean", "CV F1 std", "Fit s", "Predict s"]
+        cols = ["Accuracy", "Precision", "Recall", "F1", "ROC-AUC", "PR-AUC", "CV F1 mean", "CV F1 std", "Fit s", "Predict s", "Efficiency %"]
         L += [f"### {r['name']}", "", md(r["results"][cols]), "",
               f"Test set: {r['log']['test_rows']:,} rows, {r['log']['test_positive']:,} positives "
               f"({r['stats']['minority_rate']:.3%} minority share overall). "
@@ -474,12 +497,11 @@ def write_report(out, runs, ds_scores, ds_ratings, model_ds, model_overall, args
 
     L += ["## 5. Model evaluation and weight allocation", "",
           "Weights: predictive performance 35% (what we ultimately want), robustness 30% (a model that is good on "
-          "one split but unstable is risky), speed 20%, general-purpose suitability 15%. Every component is a "
+          "one split but unstable is risky), speed & efficiency 20%, general-purpose suitability 15%. Every component is a "
           "1-10 rating computed from MEASURED values:", "",
           "- Predictive performance = 10 x mean(F1, PR-AUC, ROC-AUC) on the test set (minority class)",
           "- Robustness = 10 x (1 - min(1, (CV-F1 std + |CV-F1 mean - test F1|) / 0.2))",
-          "- Speed = log-scaled min-max of (fit + predict seconds), fastest = 10, slowest = 1 "
-          "(single-run wall-clock timings; machine-dependent)",
+          "- Speed & Efficiency = Normalized computational efficiency percentage (where the fastest pipeline equals 100%) mapped onto a 1-10 scale",
           "- General-purpose suitability = 10 x the model's *worst* performance score across the two datasets", ""]
     for n, t in model_ds.items():
         L += [f"### {n}", "", md(t, 2), ""]
@@ -551,8 +573,8 @@ def score_charts(out, ds_ratings, ds_scores, model_overall):
 # --------------------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bank", required=True, help="Bank Marketing CSV (e.g. bank-full.csv)")
-    ap.add_argument("--fraud", required=True, help="Credit Card Fraud CSV (creditcard.csv)")
+    ap.add_argument("--bank", help="Bank Marketing CSV; if omitted, downloaded via kagglehub")
+    ap.add_argument("--fraud", help="Credit Card Fraud CSV; if omitted, downloaded via kagglehub")
     ap.add_argument("--out", default="results")
     ap.add_argument("--quick", action="store_true", help="fewer trees / folds / CV rows (faster, noisier)")
     ap.add_argument("--drop-duration", action="store_true", help="drop leaky 'duration' column from bank data")
@@ -570,6 +592,10 @@ def main():
             if not 1 <= v <= 10:
                 raise ValueError(f"{ds}/{k}: rating must be 1-10")
 
+    if not args.bank:
+        args.bank = kaggle_csv(KAGGLE_BANK, "bank.csv")
+    if not args.fraud:
+        args.fraud = kaggle_csv(KAGGLE_FRAUD, "creditcard.csv")
     bank_df, bank_t = read_bank(args.bank)
     if args.drop_duration and "duration" in bank_df.columns:
         bank_df = bank_df.drop(columns="duration")
